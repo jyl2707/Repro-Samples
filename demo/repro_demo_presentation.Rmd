@@ -1,0 +1,796 @@
+---
+title: "Repro Samples Method — Short Course Demo"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = TRUE,
+  fig.width  = 8,
+  fig.height = 5
+)
+```
+
+```{r load-functions, cache=FALSE}
+# Works whether running interactively (wd = repro_demo/) or knitting (wd = demo/)
+base_path <- if (file.exists("gmm/functions.R")) "." else ".."
+source(file.path(base_path, "gmm/functions.R"))
+source(file.path(base_path, "hd_linear/functions.R"))
+
+library(ggplot2)
+library(mixAK)   # for SLC data and data(SLC)
+```
+
+---
+
+# Part 1: Gaussian Mixture Model with Unknown Number of Components
+
+**Goal:** Given i.i.d. data $Y_i$ from a $K_0$-component Gaussian mixture, construct a
+confidence set for the unknown discrete parameter $K_0$.
+
+**Challenge:** $K_0$ is a discrete integer — CLT-based methods cannot form valid CIs
+directly. The repro samples approach bypasses this by working with the generative model.
+
+---
+
+## 1.1 Real Data — SLC Dataset
+
+190 red-blood-cell sodium–lithium countertransport (SLC) measurements.
+Earlier work (Roeder 1994; Chen et al. 2012) analyzed this with GMMs.
+
+```{r slc-load}
+data(SLC)
+ys_real <- SLC$SLC
+cat("n =", length(ys_real), "  mean =", round(mean(ys_real), 3),
+    "  sd =", round(sd(ys_real), 3))
+```
+
+```{r slc-plot, fig.cap="SLC data histogram with GMM density fits for K = 2, 3, 4"}
+# Fit K = 2, 3, 4 via EM
+fit_list <- lapply(2:4, function(k) GMM(matrix(ys_real), k, seed = 42))
+
+# Build density curves
+x_seq <- seq(min(ys_real) - 0.05, max(ys_real) + 0.05, length.out = 500)
+density_df <- do.call(rbind, lapply(seq_along(fit_list), function(j) {
+  k   <- j + 1
+  fit <- fit_list[[j]]
+  w   <- as.vector(fit$weights)
+  mu  <- as.vector(fit$centroids)
+  sig <- sqrt(as.vector(fit$covariance_matrices))
+  dens <- rowSums(sapply(seq_len(k), function(i) w[i] * dnorm(x_seq, mu[i], sig[i])))
+  data.frame(x = x_seq, density = dens, K = factor(paste0("K = ", k)))
+}))
+
+ggplot() +
+  geom_histogram(aes(x = ys_real, y = after_stat(density)),
+                 bins = 30, fill = "steelblue", alpha = 0.4, color = "white") +
+  geom_line(data = density_df, aes(x = x, y = density, color = K), linewidth = 1.1) +
+  scale_color_manual(values = c("K = 2" = "#e74c3c", "K = 3" = "#2ecc71", "K = 4" = "#9b59b6")) +
+  labs(title = "SLC Data: Histogram and Fitted GMM Densities",
+       x = "SLC Measurement", y = "Density", color = "# Components") +
+  theme_bw(base_size = 14)
+```
+
+Visually, it is not clear whether $K_0 = 2, 3$, or $4$.
+The repro samples method will give a formal 95% confidence set.
+
+---
+
+## 1.2 Simulation Data — Synthetic K₀ = 4
+
+To clearly demonstrate the method we use a synthetic 4-component GMM with
+well-separated components, so the true structure is unambiguous.
+
+```{r slc-sim-setup}
+# Four clearly separated components, equal weights
+K0_sim <- 4
+mu0    <- c(-4, -1, 2, 5)
+sigma0 <- c(0.8, 0.8, 0.8, 0.8)
+p0     <- c(0.25, 0.25, 0.25, 0.25)
+
+cat("Component weights:  ", p0, "\n")
+cat("Component means:    ", mu0, "\n")
+cat("Component std devs: ", sigma0, "\n")
+```
+
+**Generative model:**
+$$Y_i = \sum_{k=1}^{K_0} m_{ik}(\mu_k + \sigma_k U_i), \quad U_i \overset{iid}{\sim} N(0,1)$$
+where $M = (m_{ik}) \in \{0,1\}^{n \times K_0}$ is the (unobserved) membership matrix.
+
+```{r slc-sim-generate}
+set.seed(2025)
+n_sim <- 200
+
+M_sim  <- factor(sample(1:K0_sim, n_sim, replace = TRUE, prob = p0))
+M_mat  <- model.matrix(~ M_sim - 1)
+U_rel  <- rnorm(n_sim)
+ys_obs <- as.vector(M_mat %*% mu0 + diag(U_rel) %*% M_mat %*% sigma0)
+
+cat("Simulated data:  n =", n_sim, "  true K₀ =", K0_sim)
+```
+
+```{r slc-sim-plot, fig.cap="Simulated data (K₀ = 4) with true density — four peaks clearly visible"}
+x_seq_sim <- seq(min(ys_obs) - 1, max(ys_obs) + 1, length.out = 500)
+true_dens_df <- data.frame(
+  x = x_seq_sim,
+  density = rowSums(sapply(1:K0_sim, function(k)
+    p0[k] * dnorm(x_seq_sim, mu0[k], sigma0[k])))
+)
+
+ggplot() +
+  geom_histogram(aes(x = ys_obs, y = after_stat(density)),
+                 bins = 35, fill = "#3498db", alpha = 0.4, color = "white") +
+  geom_line(data = true_dens_df, aes(x = x, y = density),
+            color = "#e74c3c", linewidth = 1.3) +
+  labs(title = "Simulated GMM Data (true K₀ = 4)",
+       subtitle = "Red curve: true density  |  Four peaks are clearly visible",
+       x = "Y", y = "Density") +
+  theme_bw(base_size = 14)
+```
+
+---
+
+## 1.3 Repro Sampling — Core Steps
+
+### Observed K estimate (BIC)
+
+```{r gmm-khat}
+K_h_grid <- 1:8
+set.seed(2025)
+K_hat_obs <- Estimate_K(ys_obs, K_grid = K_h_grid, seed_local = 2025)$K_hat
+cat("BIC-selected K on observed data: K_hat =", K_hat_obs)
+```
+
+---
+
+### Step 1 · Fisher Inversion → Candidate Set $\widehat{Y}(y_{obs})$
+
+For each repro copy $\mathbf{u}^* \sim N(\mathbf{0}, \mathbf{I}_n)$, we solve
+
+$$(\tau^*, M^*) = \arg\min_{(\tau, M_\tau)} \min_{\mu, \bar{\sigma}} \;
+n \log\!\left(\frac{\|y_{obs} - M_\tau \mu - \bar{\sigma}\, u^*\|^2 + 1}{n}\right)
++ \lambda \cdot \tau \log n$$
+
+by fitting a mixture linear regression $y_{obs} \sim u^*$ with `flexmix`.
+
+```{r gmm-candidate, cache=TRUE, results='hide'}
+set.seed(2025)
+repro_M_size <- 30          # number of u* draws for candidate set
+invisible(capture.output(
+  M_candidate <- Get_M_u_BIC_modified(ys_obs, K_h_grid, repro_M_size = repro_M_size)
+))
+
+K_cand_vec   <- apply(M_candidate, 2, function(v) length(unique(v)))
+n_unique_M   <- ncol(M_candidate)
+```
+
+```{r gmm-candidate-print}
+cat("Repro draws:", repro_M_size, "\n")
+cat("Unique candidate M's:", n_unique_M, "\n")
+cat("K values in candidate set:", sort(unique(K_cand_vec)), "\n")
+```
+
+```{r gmm-candidate-plot, fig.cap="Distribution of K in candidate set (Fisher inversion)"}
+cand_df <- data.frame(K = K_cand_vec)
+ggplot(cand_df, aes(x = factor(K))) +
+  geom_bar(fill = "#2980b9", color = "white", width = 0.6) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, size = 5) +
+  labs(title = "Candidate Set: How Many Times Each K Appeared",
+       subtitle = paste("Each bar = one u* draw leading to that K via modified BIC"),
+       x = "K (number of components)", y = "Count") +
+  theme_bw(base_size = 14)
+```
+
+---
+
+### Step 2 · Nuclear Mapping $\widetilde{T}(y_{obs}, \tau, M_\tau)$
+
+For each candidate $(K, M)$, generate repro samples $Y' = M \mathbf{a}(y_{obs}) + \text{diag}(M \mathbf{b}(y_{obs}))\, \mathbf{c}(U')$
+and compute the nuclear statistic:
+
+$$\widetilde{T}(y_{obs}, K, M) = \sum_{\bar{K}: \hat{P}_{Y'}(\bar{K}) > \hat{P}_{Y'}(K_{obs})} \hat{P}_{Y'}(\bar{K})$$
+
+```{r gmm-nuclear, cache=TRUE, results='hide'}
+set.seed(2025)
+repro_size    <- 100    # Monte-Carlo size for nuclear mapping
+
+unique_K_vals  <- sort(unique(K_cand_vec))
+nuclear_per_K  <- numeric(length(unique_K_vals))
+
+for (j in seq_along(unique_K_vals)) {
+  k_j    <- unique_K_vals[j]
+  idx_j  <- which(K_cand_vec == k_j)
+  nuclear_per_K[j] <- min(sapply(idx_j, function(i) {
+    invisible(capture.output(
+      nuc <- Get_nuclear_M(ys_obs, as.vector(M_candidate[, i]),
+                           K_hat_obs, repro_size, K_h_grid,
+                           seed_local_repro = 2025)
+    ))
+    nuc$Nuclear_values_2
+  }))
+}
+
+nuclear_df <- data.frame(K = unique_K_vals, Nuclear = round(nuclear_per_K, 4))
+knitr::kable(nuclear_df,
+             col.names = c("K (candidate)", "Nuclear statistic  min_M T̃"),
+             caption = "Nuclear statistic per candidate K (smaller = more consistent with data)")
+```
+
+---
+
+### Step 3 · 95% Confidence Set for $K_0$
+
+$$\Xi_{0.95}(y_{obs}) = \{K : \min_{M_K} \widetilde{T}(y_{obs}, K, M_K) \le 0.95\}$$
+
+```{r gmm-confidence-set}
+alpha <- 0.05
+
+# skip_K_obs = TRUE: K_hat_obs is always included (matches original code logic).
+# Repro sampling only needs to judge whether *other* K values are also plausible.
+K_confidence_set <- unique(sort(c(
+  K_hat_obs,                                      # always in CS
+  nuclear_df$K[nuclear_df$Nuclear <= (1 - alpha)] # others passing nuclear test
+)))
+
+nuclear_df$In_CS <- ifelse(
+  nuclear_df$K == K_hat_obs,
+  "✓ K̂_obs (auto-included)",
+  ifelse(nuclear_df$Nuclear <= (1 - alpha), "✓ In 95% CS", "✗ Excluded")
+)
+knitr::kable(nuclear_df,
+             col.names = c("K", "Nuclear statistic", "In Confidence Set"),
+             caption = "95% Confidence set for K₀  (K̂_obs is always included)")
+
+cat("K̂_obs (BIC on data):", K_hat_obs, "\n")
+cat("95% Confidence Set for K₀:", K_confidence_set, "\n")
+cat("True K₀ =", K0_sim, "  →  Covered:", K0_sim %in% K_confidence_set, "\n")
+```
+
+```{r gmm-cs-plot, fig.cap="Nuclear statistics with 95% threshold"}
+ggplot(nuclear_df, aes(x = factor(K), y = Nuclear, fill = In_CS)) +
+  geom_col(width = 0.6, color = "white") +
+  geom_hline(yintercept = 1 - alpha, linetype = "dashed",
+             color = "#e74c3c", linewidth = 1.1) +
+  annotate("text", x = 0.7, y = 1 - alpha + 0.02,
+           label = "95% threshold", color = "#e74c3c", size = 4, hjust = 0) +
+  scale_fill_manual(values = c("✓ K̂_obs (auto-included)" = "#2980b9",
+                               "✓ In 95% CS"             = "#27ae60",
+                               "✗ Excluded"              = "#e74c3c")) +
+  labs(title = "Nuclear Statistic per Candidate K",
+       subtitle = "K values below the dashed line are in the 95% confidence set",
+       x = "K (number of components)", y = "Nuclear statistic", fill = NULL) +
+  theme_bw(base_size = 14)
+```
+
+---
+
+## 1.4 Apply to Real SLC Data
+
+```{r gmm-slc-real, cache=TRUE, results='hide'}
+set.seed(2025)
+invisible(capture.output(
+  M_cand_real <- Get_M_u_BIC_modified(ys_real, K_h_grid, repro_M_size = 30)
+))
+K_cand_real   <- apply(M_cand_real, 2, function(v) length(unique(v)))
+K_hat_real    <- Estimate_K(ys_real, K_h_grid, seed_local = 2025)$K_hat
+
+unique_K_real <- sort(unique(K_cand_real))
+nuclear_real  <- numeric(length(unique_K_real))
+
+for (j in seq_along(unique_K_real)) {
+  k_j   <- unique_K_real[j]
+  idx_j <- which(K_cand_real == k_j)
+  nuclear_real[j] <- min(sapply(idx_j, function(i) {
+    invisible(capture.output(
+      nuc <- Get_nuclear_M(ys_real, as.vector(M_cand_real[, i]),
+                           K_hat_real, 80, K_h_grid, 2025)
+    ))
+    nuc$Nuclear_values_2
+  }))
+}
+
+cs_real <- unique_K_real[nuclear_real <= 0.95]
+cat("Real SLC data — 95% Confidence Set for K₀:", cs_real, "\n")
+```
+
+
+
+---
+
+# Part 2: High-Dimensional Linear Regression
+
+**Goal:** Given $n = 50$ observations, $p = 1000$ predictors, only 3 are true signals.
+Construct (a) a **model confidence set** for the true sparsity pattern $\tau_0$ and
+(b) **coefficient confidence intervals** accounting for model selection uncertainty.
+
+**Model:** $y_{obs} = X_{\tau_0} \beta_{\tau_0} + \sigma_0 u^{rel}$, $\; u^{rel} \sim N(0, I_n)$
+
+---
+
+## 2.1 Simulation Data — Model M1
+
+```{r hlm-data}
+set.seed(42)
+n <- 50
+p <- 1000
+rho <- 0.5
+sigma_true <- 1
+beta_true <- rep(0, p)
+beta_true[c(1, 2, 3)] <- c(3, 2, 1.5)
+
+Sigma <- rho^(abs(outer(1:p, 1:p, "-")))
+X <- MASS::mvrnorm(n, rep(0, p), Sigma)
+Y <- X %*% beta_true + rnorm(n, sd = sigma_true)
+
+cat("True nonzero variables: {1, 2, 3}\n")
+cat("True coefficients:       β₁=3, β₂=2, β₃=1.5\n")
+cat("Data dimensions:         n =", n, ", p =", p, "\n")
+```
+
+```{r hlm-data-plot, fig.cap="Response Y vs the three true predictors", fig.height=4}
+scatter_df <- data.frame(
+  Y  = rep(Y, 3),
+  X_val = c(X[, 1], X[, 2], X[, 3]),
+  Var = rep(c("X₁  (β=3)", "X₂  (β=2)", "X₃  (β=1.5)"), each = n)
+)
+
+ggplot(scatter_df, aes(x = X_val, y = Y)) +
+  geom_point(alpha = 0.6, color = "#2980b9") +
+  geom_smooth(method = "lm", se = FALSE, color = "#e74c3c", linewidth = 1.1) +
+  facet_wrap(~ Var, scales = "free_x") +
+  labs(title = "Response Y vs True Signal Predictors",
+       x = "Predictor value", y = "Y") +
+  theme_bw(base_size = 13)
+```
+
+---
+
+## 2.2 Repro Sampling — Core Steps
+
+### Step 1 · Fisher Inversion → Candidate Model Set $S^{(d)}$
+
+For each repro copy $u^*_b \sim N(0, I_n)$, solve:
+$$\hat{h}_b = \arg\min_{\tau} \min_{\beta, \sigma}
+\|y_{obs} - X_\tau \beta_\tau - \sigma u^*_b\|^2 + \lambda |\tau|$$
+
+by running **adaptive Lasso** on the augmented design $[X \mid u^*_b]$.
+The $u^*$ coefficient's magnitude estimates $\sigma$.
+
+```{r hlm-fisher, cache=TRUE, results='hide'}
+set.seed(2025)
+d <- 100   # number of repro copies
+
+result <- rps_hlm_inf(
+  Y                = Y,
+  X                = X,
+  rps_size_candidate = d,
+  rps_size_modelcs   = 100,
+  beta_index         = 1:p,
+  intercept          = FALSE,
+  u_star_seed        = 2025,
+  keep_solution_path = TRUE
+)
+```
+
+```{r hlm-candidate-summary}
+cand_models <- result$candidate_model_list
+cat("Fisher inversion: d =", d, "repro draws\n")
+cat("Unique candidate models found:", length(cand_models), "\n\n")
+
+# Model sizes
+sizes <- sapply(cand_models, length)
+cat("Candidate model sizes (# selected variables):\n")
+print(sort(sizes))
+```
+
+```{r hlm-freq-plot, fig.cap="Variable selection frequency across d=100 repro copies", fig.height=3.5}
+# Count how often each variable appears across all repro samples
+all_vars <- unlist(result$candidate_model_list)
+freq_df  <- as.data.frame(table(Variable = all_vars))
+freq_df$Variable <- as.integer(as.character(freq_df$Variable))
+freq_df <- freq_df[order(-freq_df$Freq), ]
+
+top_vars <- head(freq_df, 20)
+top_vars$is_true <- top_vars$Variable %in% c(1, 2, 3)
+
+ggplot(top_vars, aes(x = reorder(factor(Variable), Freq),
+                     y = Freq, fill = is_true)) +
+  geom_col(color = "white") +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#7f8c8d"),
+                    labels = c("FALSE" = "False positive", "TRUE" = "True signal")) +
+  labs(title = "Top-20 Variables by Selection Frequency",
+       subtitle = "Red = true signal variables (1, 2, 3)",
+       x = "Variable index", y = "Times selected (out of 100 repro copies)", fill = NULL) +
+  theme_bw(base_size = 13)
+```
+
+---
+
+### Step 2 · Unique Candidate Models
+
+```{r hlm-candidate-table}
+cand_table <- data.frame(
+  Model_ID     = seq_along(cand_models),
+  Variables    = sapply(cand_models, function(m) paste(m, collapse = ", ")),
+  Model_Size   = sapply(cand_models, length),
+  p_value      = round(result$model_inf$p_value_vector, 4)
+)
+knitr::kable(cand_table,
+             col.names = c("Model", "Selected Variables", "Size |τ|", "p-value"),
+             caption = "Candidate models from Fisher inversion, with Fisher-Dempster p-values")
+```
+
+---
+
+### Step 3 · Fisher-Dempster Inversion → Model Confidence Set
+
+For each candidate $\tau_b \in S^{(d)}$, compute the **conditional p-value**:
+
+$$\hat{F}_{(w, \tau_b)}\{\hat{T}(y_{obs}, \tau_b)\} =
+  \sum_{\tau': \hat{p}_{(w,\tau_b)}(\tau') \le \hat{p}_{(w,\tau_b)}(\hat{T}(y_{obs},\tau_b))} \hat{p}_{(w,\tau_b)}(\tau')$$
+
+The **model confidence set** is $\Gamma_{0.95}^\tau(y_{obs}) = S^{(d)} \cap \{\tau_b : \hat{F} \ge 0.05\}$.
+
+```{r hlm-model-cs}
+model_cs <- result$model_inf$model_cs
+cat("95% Model Confidence Set contains", length(model_cs), "model(s):\n\n")
+for (i in seq_along(model_cs)) {
+  cat("  Model", i, ":", paste(model_cs[[i]], collapse = ", "), "\n")
+}
+cat("\nTrue model (tau_0): {1, 2, 3}\n")
+```
+
+```{r hlm-model-cs-plot, fig.cap="Candidate models and their p-values; CS = p-value ≥ 0.05", fig.height=3.5}
+cand_table$In_CS <- cand_table$p_value >= 0.05
+ggplot(cand_table, aes(x = factor(Model_ID), y = p_value, fill = In_CS)) +
+  geom_col(color = "white", width = 0.6) +
+  geom_hline(yintercept = 0.05, linetype = "dashed",
+             color = "#e74c3c", linewidth = 1.1) +
+  annotate("text", x = 0.7, y = 0.07, label = "α = 0.05",
+           color = "#e74c3c", size = 4, hjust = 0) +
+  scale_fill_manual(values = c("TRUE" = "#27ae60", "FALSE" = "#e74c3c")) +
+  labs(title = "Fisher-Dempster p-values for Candidate Models",
+       subtitle = "Green (p ≥ 0.05) → in 95% model confidence set",
+       x = "Candidate model ID", y = "p-value", fill = "In 95% CS") +
+  theme_bw(base_size = 13)
+```
+
+---
+
+### Step 4 · Coefficient Confidence Intervals
+
+For each regression coefficient $\beta_i$, the repro samples CI is the **union of OLS intervals**
+across all models in the confidence set that contain variable $i$:
+
+$$\Gamma_{0.95}^{\beta_i}(y_{obs}) = \bigcup_{\tau \in S^{(d)}}
+  \left\{\beta_i : \hat{T}(y_{obs}, (\beta_i, \tau)) \le F^{-1}_{1,\, n-|\tau|}(0.95)\right\}$$
+
+```{r hlm-beta-cs}
+# Extract CIs for variables 1, 2, 3, 4, 5, 10 (mix of signals and zeros)
+focus_vars <- c(1, 2, 3, 4, 5, 10)
+beta_cs_list <- result$beta_i_cs[focus_vars]
+
+ci_df <- do.call(rbind, lapply(seq_along(focus_vars), function(j) {
+  v  <- focus_vars[j]
+  ci <- as.matrix(beta_cs_list[[j]])
+  if (nrow(ci) == 0) return(data.frame(var=v, lo=0, hi=0))
+  data.frame(var = v, lo = min(ci[,1]), hi = max(ci[,2]))
+}))
+
+ci_df$true_beta <- beta_true[ci_df$var]
+ci_df$is_signal <- ci_df$var %in% c(1, 2, 3)
+ci_df$label     <- paste0("β", ci_df$var)
+
+knitr::kable(data.frame(
+  Variable   = paste0("β", ci_df$var),
+  True_Value = ci_df$true_beta,
+  CI_Lower   = round(ci_df$lo, 3),
+  CI_Upper   = round(ci_df$hi, 3),
+  Width      = round(ci_df$hi - ci_df$lo, 3),
+  Covers     = ci_df$true_beta >= ci_df$lo & ci_df$true_beta <= ci_df$hi
+), caption = "95% Repro Samples Confidence Intervals for Regression Coefficients")
+```
+
+```{r hlm-ci-plot, fig.cap="95% confidence intervals; red dots = true coefficient values", fig.height=4}
+ggplot(ci_df, aes(x = label, color = is_signal)) +
+  geom_segment(aes(y = lo, yend = hi, xend = label), linewidth = 2.5, alpha = 0.7) +
+  geom_point(aes(y = true_beta), shape = 18, size = 4, color = "#e74c3c") +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "gray40") +
+  scale_color_manual(values = c("TRUE" = "#2980b9", "FALSE" = "#95a5a6"),
+                     labels = c("TRUE" = "True signal", "FALSE" = "True zero")) +
+  labs(title = "95% Repro Samples Coefficient Confidence Intervals",
+       subtitle = "Segments = CI range; red diamonds = true β values",
+       x = "Coefficient", y = "Value", color = NULL) +
+  theme_bw(base_size = 13)
+```
+
+---
+
+# Part 3: High-Dimensional Binary Classification
+
+**Goal:** Given $n = 100$ observations and $p = 50$ predictors with binary response $Y \in \{0,1\}$,
+only 3 variables carry signal.
+Construct (a) a **model confidence set** for the true active feature set $\tau_0$ and
+(b) **coefficient confidence intervals** for the working logistic GLM coefficients $\boldsymbol{\beta}_{0,\tau_0}$.
+
+**Generative model (Hou et al. 2025):**
+$$Y_i = \mathbf{1}\{\mu(X_i) > U_i\}, \quad U_i \overset{iid}{\sim} \mathrm{Unif}(0,1)$$
+Via the logit working model this becomes
+$Y_i = \mathbf{1}\{X_{i,\tau_0}^\top\boldsymbol{\beta}_{0,\tau_0} + \varepsilon_i > 0\}$
+with $\varepsilon_i \sim \mathrm{Logistic}(0,1)$.
+
+**Same repro logic — different noise distribution:**
+Just as Part 2 augments $X$ with a Gaussian noise column $u^* \sim N(0,1)$, here we augment
+with a **logistic noise column** $\varepsilon^* \sim \mathrm{Logistic}(0,1)$ and run sparse logistic regression
+(adaptive lasso) with the $\varepsilon^*$ column unpenalized.
+
+---
+
+## 3.1 Simulation Data
+
+```{r clf-setup, cache=FALSE}
+clf_path <- if (file.exists("../classification/functions.R")) {
+  "../classification"
+} else {
+  "classification"
+}
+source(file.path(clf_path, "functions.R"))
+library(glmnet); library(gcdnet); library(e1071); library(intervals)
+
+with_intercept <- FALSE   # global variable required by get_tau_s
+```
+
+```{r clf-data}
+set.seed(2025)
+n_clf      <- 100
+p_clf      <- 50
+s_clf      <- 5       # sparsity constraint for working model
+conf_level <- 0.95    # confidence level (α in Hou et al. notation)
+
+beta_clf <- rep(0, p_clf)
+beta_clf[c(1, 2, 3)] <- c(3, 2, 1.5)
+
+X_clf  <- matrix(rnorm(n_clf * p_clf), n_clf, p_clf)
+mu_clf <- 1 / (1 + exp(-X_clf %*% beta_clf))
+Y_clf  <- as.numeric(runif(n_clf) < mu_clf)
+
+cat("n =", n_clf, "  p =", p_clf, "  true signals: {1, 2, 3}\n")
+cat("True β: β₁=3, β₂=2, β₃=1.5\n")
+cat("Class balance:  Y=0:", sum(Y_clf == 0), "  Y=1:", sum(Y_clf == 1), "\n")
+```
+
+```{r clf-data-plot, fig.cap="Distribution of true logit score by class — clear separation confirms identifiable signals"}
+score_df <- data.frame(
+  score = as.vector(X_clf %*% beta_clf),
+  Y = factor(Y_clf, labels = c("Y=0", "Y=1"))
+)
+ggplot(score_df, aes(x = score, fill = Y)) +
+  geom_histogram(position = "identity", bins = 25, alpha = 0.6, color = "white") +
+  scale_fill_manual(values = c("Y=0" = "#e74c3c", "Y=1" = "#2980b9")) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(title = "True Logit Score Distribution by Class",
+       x = expression(X[1]*beta[1] + X[2]*beta[2] + X[3]*beta[3]),
+       y = "Count", fill = NULL) +
+  theme_bw(base_size = 14)
+```
+
+---
+
+## 3.2 Repro Sampling — Core Steps
+
+### Step 1 · Fisher Inversion → Model Candidate Set $\mathcal{C}$
+
+For each repro copy $\varepsilon^{*(b)} \sim \mathrm{Logistic}(0,1)^n$, augment the design:
+$$[X \mid \varepsilon^{*(b)}] \in \mathbb{R}^{n \times (p+1)}$$
+Run **adaptive lasso** logistic regression with the $\varepsilon^*$ column **unpenalized**.
+The selected support $\hat{\tau}(\varepsilon^{*(b)})$ estimates $\tau_0$ under that noise draw.
+Collect all unique supports: $\mathcal{C} = \{\hat{\tau}(\varepsilon^{*(1)}), \ldots, \hat{\tau}(\varepsilon^{*(d)})\}$.
+
+```{r clf-candidate, cache=TRUE, results='hide'}
+set.seed(2025)
+n_tau_clf <- 50   # repro draws for candidate set
+
+epsilons_cand <- matrix(rlogis(n_clf * n_tau_clf), nrow = n_clf)
+tau_candidate_clf <- get_tau_s(X_clf, Y_clf, epsilons_cand, s_clf, method = "logis adapt")
+```
+
+```{r clf-candidate-print}
+cat("Repro draws d =", n_tau_clf, "\n")
+cat("Unique candidate models:", length(tau_candidate_clf), "\n")
+cat("Candidate model sizes:", sort(sapply(tau_candidate_clf, length)), "\n\n")
+
+all_vars_clf <- sort(unique(unlist(tau_candidate_clf)))
+cat("Variables appearing in any candidate:", paste(all_vars_clf, collapse = ", "), "\n")
+```
+
+```{r clf-candidate-plot, fig.cap="Variable selection frequency across 50 repro copies (red = true signals {1,2,3})"}
+freq_clf    <- table(unlist(tau_candidate_clf))
+freq_df_clf <- data.frame(Variable = as.integer(names(freq_clf)),
+                           Freq     = as.integer(freq_clf))
+freq_df_clf <- freq_df_clf[order(-freq_df_clf$Freq), ]
+top_clf     <- head(freq_df_clf, 15)
+top_clf$is_true <- top_clf$Variable %in% c(1, 2, 3)
+
+ggplot(top_clf, aes(x = reorder(factor(Variable), Freq), y = Freq, fill = is_true)) +
+  geom_col(color = "white") +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#7f8c8d"),
+                    labels = c("TRUE" = "True signal", "FALSE" = "False positive")) +
+  labs(title = "Top-15 Variables by Selection Frequency (Classification)",
+       subtitle = "Red = true signal variables {1, 2, 3}",
+       x = "Variable index", y = paste0("Times selected (out of ", n_tau_clf, " repro copies)"),
+       fill = NULL) +
+  theme_bw(base_size = 13)
+```
+
+---
+
+### Step 2 · Nuclear Mapping → Model Confidence Set
+
+For each candidate $\tau \in \mathcal{C}$:
+
+1. Fit logistic GLM on $(Y, X_\tau)$ to get $\hat{\boldsymbol{\beta}}_\text{MLE}$.
+2. Generate $n_\text{mc}$ repro responses:
+   $Y^*_i = \mathbf{1}\{X_{i,\tau}^\top\hat{\boldsymbol{\beta}}_\text{MLE} + \varepsilon^*_i > 0\}$
+3. Fit lasso on each $Y^*$ to get $\hat{\tau}^*$; record its empirical distribution.
+4. Nuclear statistic:
+   $\widetilde{T}(\tau, \hat{\boldsymbol{\beta}}) = \hat{P}\!\left(\hat{\tau}^* \text{ more probable than } \hat{\tau}_\text{obs}\right)$
+
+Model confidence set at level 0.95:
+$$\Gamma_{0.95}^\tau = \{\tau \in \mathcal{C} : \widetilde{T}(\tau, \hat{\boldsymbol{\beta}}_\text{MLE}) \le 0.95\}$$
+
+```{r clf-model-cs, cache=TRUE, results='hide'}
+set.seed(2025)
+n_mc_clf <- 100
+
+# Lasso-selected model on observed data (reference for nuclear mapping)
+fit_obs_clf  <- glmnet(X_clf, Y_clf, family = "binomial", intercept = with_intercept)
+tau_obs_idx  <- max(which(fit_obs_clf$df <= s_clf))
+tau_fit_obs  <- which(coef.glmnet(fit_obs_clf)[-1, tau_obs_idx] != 0)
+
+epsilons_mc_clf <- matrix(rlogis(n_clf * n_mc_clf), nrow = n_clf)
+
+nuclear_clf  <- numeric(length(tau_candidate_clf))
+tau_cs_clf   <- list()
+
+for (j in seq_along(tau_candidate_clf)) {
+  tau    <- tau_candidate_clf[[j]]
+  Data_j <- data.frame(Y = Y_clf, X_work = X_clf[, tau, drop = FALSE])
+  beta_mle_j <- tryCatch(
+    glm(Y ~. - 1, data = Data_j, family = binomial(link = "logit"))$coefficients,
+    error = function(e) rep(0, length(tau))
+  )
+  nuc <- nuclear_tau_nuisance(beta_mle_j, X_clf, epsilons_mc_clf,
+                               tau_fit_obs, tau, with_intercept, n_mc_clf)
+  nuclear_clf[j] <- nuc
+  if (nuc <= conf_level) tau_cs_clf <- c(tau_cs_clf, list(tau))
+}
+```
+
+```{r clf-model-cs-print}
+cat("Total candidate models:", length(tau_candidate_clf), "\n")
+cat("Models in 95% confidence set:", length(tau_cs_clf), "\n\n")
+
+for (i in seq_along(tau_cs_clf)) {
+  cat("  Model", i, ": {", paste(tau_cs_clf[[i]], collapse = ", "), "}\n")
+}
+
+# Under a sparsity-s working model, the CS identifies the best s-sparse approximation.
+# The true signals {1,2,3} should appear in CS models even if exact {1,2,3} is not the CS target.
+any_contains_true <- any(sapply(tau_cs_clf, function(tau) all(c(1, 2, 3) %in% tau)))
+cat("\nTrue signals {1,2,3} in at least one CS model:", any_contains_true, "\n")
+cat("(Working model uses sparsity s =", s_clf, "— CS models contain true signals plus",
+    "best-fitting additional variables.)\n")
+```
+
+```{r clf-model-cs-plot, fig.cap="Nuclear statistics per candidate model; ≤ 0.95 threshold → included in confidence set"}
+nuc_df_clf <- data.frame(
+  Model   = seq_along(tau_candidate_clf),
+  Nuclear = nuclear_clf,
+  In_CS   = nuclear_clf <= conf_level
+)
+
+ggplot(nuc_df_clf, aes(x = factor(Model), y = Nuclear, fill = In_CS)) +
+  geom_col(width = 0.7, color = "white") +
+  geom_hline(yintercept = conf_level, linetype = "dashed",
+             color = "#e74c3c", linewidth = 1.1) +
+  annotate("text", x = 0.6, y = conf_level + 0.02,
+           label = "95% threshold", color = "#e74c3c", size = 4, hjust = 0) +
+  scale_fill_manual(values = c("TRUE" = "#27ae60", "FALSE" = "#e74c3c"),
+                    labels = c("TRUE" = "In 95% CS", "FALSE" = "Excluded")) +
+  labs(title = "Nuclear Statistic per Candidate Classification Model",
+       subtitle = "Models at or below 0.95 are in the 95% model confidence set",
+       x = "Candidate model ID", y = expression(tilde(T)(tau)), fill = NULL) +
+  theme_bw(base_size = 13)
+```
+
+---
+
+### Step 3 · Coefficient Confidence Intervals (Wald Union)
+
+For each $\tau$ in the model confidence set, fit logistic GLM and compute a Wald CI for $\beta_j$.
+The coefficient confidence set is the **union across all models in $\Gamma_{0.95}^\tau$**:
+
+$$\Gamma_{0.95}^{\beta_j} = \bigcup_{\tau \in \Gamma_{0.95}^\tau}
+  \left\{\beta_j : |\hat{\beta}_{j,\tau} - \beta_j| \le z_{0.975}\,\hat{\sigma}_{j,\tau} / \sqrt{n}\right\}$$
+
+```{r clf-beta-cs}
+focus_vars_clf <- c(1, 2, 3, 4, 5)
+
+if (length(tau_cs_clf) > 0) {
+  beta_results_clf <- betaj_cs_wald(X_clf, Y_clf, beta_clf, tau_cs_clf, alpha = conf_level)
+
+  ci_clf_df <- do.call(rbind, lapply(focus_vars_clf, function(j) {
+    ci <- as.matrix(beta_results_clf[[j]]$conf_interval)
+    if (nrow(ci) == 0 || (nrow(ci) == 1 && ci[1,1] == 0 && ci[1,2] == 0)) {
+      data.frame(var = j, lo = NA, hi = NA)
+    } else {
+      ci_real <- ci[!(ci[,1] == 0 & ci[,2] == 0), , drop = FALSE]
+      if (nrow(ci_real) == 0) data.frame(var = j, lo = NA, hi = NA)
+      else data.frame(var = j, lo = min(ci_real[,1]), hi = max(ci_real[,2]))
+    }
+  }))
+} else {
+  ci_clf_df <- data.frame(var = focus_vars_clf, lo = NA, hi = NA)
+}
+
+ci_clf_df$true_beta <- beta_clf[ci_clf_df$var]
+ci_clf_df$is_signal <- ci_clf_df$var %in% c(1, 2, 3)
+ci_clf_df$label     <- paste0("β", ci_clf_df$var)
+ci_clf_df$covers    <- !is.na(ci_clf_df$lo) &
+                       ci_clf_df$true_beta >= ci_clf_df$lo &
+                       ci_clf_df$true_beta <= ci_clf_df$hi
+
+knitr::kable(data.frame(
+  Variable  = ci_clf_df$label,
+  True_β    = ci_clf_df$true_beta,
+  CI_Lower  = round(ci_clf_df$lo, 3),
+  CI_Upper  = round(ci_clf_df$hi, 3),
+  Covers    = ci_clf_df$covers
+), caption = "95% Repro Samples Coefficient CIs — Binary Classification (Wald union over model CS)")
+```
+
+```{r clf-ci-plot, fig.cap="95% CIs for selected classification coefficients; red diamonds = true values"}
+ci_clf_plot <- ci_clf_df[!is.na(ci_clf_df$lo), ]
+
+if (nrow(ci_clf_plot) > 0) {
+  ggplot(ci_clf_plot, aes(x = label, color = is_signal)) +
+    geom_segment(aes(y = lo, yend = hi, xend = label), linewidth = 2.5, alpha = 0.7) +
+    geom_point(aes(y = true_beta), shape = 18, size = 4, color = "#e74c3c") +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "gray40") +
+    scale_color_manual(values = c("TRUE" = "#2980b9", "FALSE" = "#95a5a6"),
+                       labels = c("TRUE" = "True signal", "FALSE" = "True zero")) +
+    labs(title = "95% Repro Samples Coefficient CIs — Binary Classification",
+         subtitle = "Segments = CI range; red diamonds = true β values",
+         x = "Coefficient", y = "Value", color = NULL) +
+    theme_bw(base_size = 13)
+} else {
+  cat("No models in confidence set — increase n_tau_clf or n_mc_clf for a larger example.\n")
+}
+```
+
+---
+
+## Summary
+
+| Method | Target Parameter | Repro Noise | Key Repro Step | Result |
+|---|---|---|---|---|
+| **GMM** | Unknown $K_0$ (discrete) | $u^* \sim N(0,1)$ | Fisher inversion via mixture regression $[y \sim u^*]$ | 95% CS for $K_0$ |
+| **HD Linear** | Sparse model $\tau_0$ + coefficients $\beta$ | $u^* \sim N(0,1)$ | Fisher inversion via adaptive Lasso on $[X \mid u^*]$ | Model CS + coefficient CIs |
+| **HD Binary** | Active feature set $\tau_0$ + GLM coefficients $\beta$ | $\varepsilon^* \sim \mathrm{Logistic}(0,1)$ | Fisher inversion via adaptive Lasso on $[X \mid \varepsilon^*]$ | Model CS + coefficient CIs |
+
+All three methods share the same core principle:
+
+> **Replace the unknown noise realization $u^{rel}$ with Monte-Carlo copies $u^*$**,
+> invert the generative model to obtain candidate parameters,
+> then use a nuclear mapping to screen which candidates are consistent
+> with the observed data at level $1 - \alpha$.

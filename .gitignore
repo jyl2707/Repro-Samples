@@ -1,0 +1,14 @@
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rdata
+*.rda
+
+# knitr cache and output
+demo/*_cache/
+demo/*_files/
+demo/*.html
+
+# OS
+.DS_Store
