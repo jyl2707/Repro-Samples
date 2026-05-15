@@ -167,7 +167,7 @@ betaj_cs_wald <- function(X, Y, beta0, tau_set, alpha){
   betaj_cs_results <- vector(mode = "list", length = p)
   
   for(tau in tau_set){
-    X_work <- X[, tau]
+    X_work <- as.matrix(X[, tau, drop = FALSE])
     Data <- data.frame(Y = Y, X_work = X_work)
     beta_mle <- glm(Y ~.-1, data = Data, family = binomial(link = "logit"))$coefficients
     
@@ -213,7 +213,7 @@ sum_beta_interval_matrix<-function(conf_interval_matrix, beta0_i){
   conf_interval<-interval_union(x)
   
   coverage<-(distance_to_nearest(beta0_i, conf_interval)==0)
-  width_of_interval<-sum(size(conf_interval))
+  width_of_interval<-sum(intervals::size(conf_interval))
   
   return(list(conf_interval=conf_interval,
               coverage=coverage,
