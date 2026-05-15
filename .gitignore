@@ -10,5 +10,9 @@ demo/*_cache/
 demo/*_files/
 demo/*.html
 
+# Jupyter checkpoints
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
 # OS
 .DS_Store
